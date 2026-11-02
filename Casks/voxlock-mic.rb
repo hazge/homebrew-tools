@@ -9,7 +9,7 @@ cask "voxlock-mic" do
 
   depends_on cask: "blackhole-2ch"
   depends_on formula: "uv"
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma
 
   app "VoxLock Mic.app"
   binary "#{appdir}/VoxLock Mic.app/Contents/Resources/voxlock-mic"
