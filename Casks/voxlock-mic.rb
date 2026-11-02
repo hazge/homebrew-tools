@@ -1,6 +1,6 @@
 cask "voxlock-mic" do
-  version "0.0.1"
-  sha256 "3fa55a34140d6136923b5aa0efcd53b89dd454d6a4922d7611be1e9abd406c91"
+  version "0.0.2"
+  sha256 "db6f249904f0a0bf222a491c011e5929ba2fedc60a33c974b23657856246899f"
 
   url "https://raw.githubusercontent.com/hazge/homebrew-tools/voxlock-mic-#{version}/voxlock-mic/voxlock-mic"
   name "voxlock-mic"
@@ -14,9 +14,12 @@ cask "voxlock-mic" do
 
   caveats <<~EOS
     Reboot once after the first install of blackhole-2ch so the BlackHole device appears.
-    Then record your voice sample and pick BlackHole 2ch as the microphone in your call app:
+    Then record your voice sample and start it; the first start creates the VoxLock Microphone device:
       voxlock-mic --list
       voxlock-mic --enroll --mic "<your microphone>"
+      voxlock-mic
+    In your call app pick VoxLock Microphone as the microphone.
+    Before uninstalling, remove the device with: voxlock-mic --remove-device
     Details: https://github.com/hazge/homebrew-tools#voxlock-mic
   EOS
 end
