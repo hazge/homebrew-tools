@@ -1,0 +1,24 @@
+name: voxlock-mic app
+
+on:
+  push:
+    tags: ["voxlock-mic-*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build VoxLock Mic.app
+        run: voxlock-mic/build-app.sh "${GITHUB_REF_NAME#voxlock-mic-}"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#voxlock-mic-}"
+          gh release create "$GITHUB_REF_NAME" "voxlock-mic/dist/VoxLock-Mic-$version.zip" \
+            --title "voxlock-mic $version" \
+            --notes "VoxLock Mic menu bar app $version. Install with: brew install --cask hazge/tools/voxlock-mic"

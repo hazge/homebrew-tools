@@ -1,28 +1,63 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["voxlock==1.3.0", "sounddevice>=0.5", "soundfile>=0.12"]
+# dependencies = ["voxlock==1.3.0", "sounddevice>=0.5", "soundfile>=0.12", "rumps==0.4.0", "pyobjc-framework-Cocoa>=10"]
 # ///
 import argparse
 import ctypes
 import ctypes.util
+import fcntl
+import json
+import logging
+import os
 import plistlib
+import queue
 import re
 import struct
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
+import numpy as np
 import sounddevice as sd
 import soundfile as sf
 import voxlock
 
 SR = 16000
-SAMPLES_DIR = Path.home() / ".config/voxlock"
-DEFAULT_SAMPLE = SAMPLES_DIR / "default.wav"
+BLOCK = SR * 40 // 1000
+CONFIG_DIR = Path.home() / ".config/voxlock"
+DEFAULT_SAMPLE = CONFIG_DIR / "default.wav"
+SETTINGS_FILE = CONFIG_DIR / "settings.json"
+LOCK_FILE = CONFIG_DIR / "tray.lock"
+LOG_FILE = Path.home() / "Library/Logs/voxlock-mic.log"
+BUNDLE_ID = "com.hazge.voxlock-mic"
+LOGIN_AGENT = Path.home() / f"Library/LaunchAgents/{BUNDLE_ID}.plist"
 BLACKHOLE = "BlackHole 2ch"
 DEVICE_NAME = "VoxLock Microphone"
 DEVICE_UID = "com.hazge.voxlock-mic.aggregate"
+ICON = "🗣️"
+READ_ALOUD = (
+    "Раз, раз, проверка микрофона. Записываю образец голоса для шумоподавления, это займёт секунд десять. "
+    "Говорю обычным голосом, как на созвоне. Раз, два, три, четыре, пять.\n\n"
+    "Testing, testing, one, two. I'm recording a voice sample for noise removal, it takes about ten seconds. "
+    "I'm talking in my normal voice, like on a call. One, two, three, four, five.\n\n"
+    "Keep talking until 10 seconds pass; press Done after that."
+)
+IDLE_STOP_SECONDS = 10
+ERROR_RETRY_SECONDS = 15
+INPUT_TIMEOUT_SECONDS = 4
+SILENCE_WARNING_SECONDS = 5
+MIC_WARMUP_SECONDS = 0.3
+AUDIO_LOCK = threading.RLock()
+
+log = logging.getLogger("voxlock-mic")
+
+
+class VoxLockError(Exception):
+    pass
+
 
 coreaudio = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
 corefoundation = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
@@ -48,8 +83,8 @@ def fourcc(code):
     return struct.unpack(">I", code.encode())[0]
 
 
-def property_bytes(obj, selector):
-    address = PropertyAddress(fourcc(selector), fourcc("glob"), 0)
+def property_bytes(obj, selector, scope="glob"):
+    address = PropertyAddress(fourcc(selector), fourcc(scope), 0)
     size = ctypes.c_uint32(0)
     if coreaudio.AudioObjectGetPropertyDataSize(obj, ctypes.byref(address), 0, None, ctypes.byref(size)):
         return None
@@ -59,11 +94,18 @@ def property_bytes(obj, selector):
     return buf.raw[: size.value]
 
 
+def property_ids(obj, selector, scope="glob"):
+    data = property_bytes(obj, selector, scope) or b""
+    return list(struct.unpack(f"{len(data) // 4}I", data))
+
+
 def property_string(obj, selector):
     data = property_bytes(obj, selector)
     if not data:
         return None
     ref = ctypes.c_void_p.from_buffer_copy(data).value
+    if not ref:
+        return None
     out = ctypes.create_string_buffer(1024)
     corefoundation.CFStringGetCString(ref, out, len(out), 0x08000100)
     corefoundation.CFRelease(ref)
@@ -71,9 +113,69 @@ def property_string(obj, selector):
 
 
 def coreaudio_devices():
-    data = property_bytes(1, "dev#") or b""
-    ids = struct.unpack(f"{len(data) // 4}I", data)
-    return {property_string(d, "uid "): (d, property_string(d, "lnam")) for d in ids}
+    return {property_string(d, "uid "): (d, property_string(d, "lnam")) for d in property_ids(1, "dev#")}
+
+
+def real_input_names():
+    names = []
+    for d in property_ids(1, "dev#"):
+        name = property_string(d, "lnam")
+        if name and property_ids(d, "stm#", "inpt") and name not in (BLACKHOLE, DEVICE_NAME):
+            names.append(name)
+    return names
+
+
+def call_device_ids():
+    return {d for uid, (d, name) in coreaudio_devices().items() if uid == DEVICE_UID or name == BLACKHOLE}
+
+
+def other_readers(device_ids):
+    me = os.getpid()
+    readers = []
+    for process in property_ids(1, "prs#"):
+        pid = (property_ids(process, "ppid") or [0])[0]
+        if pid == me or not (property_ids(process, "piri") or [0])[0]:
+            continue
+        if device_ids & set(property_ids(process, "pdv#", "inpt")) and not is_voxlock_process(pid):
+            readers.append(pid)
+    return readers
+
+
+def is_voxlock_process(pid):
+    args = subprocess.run(["/bin/ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True).stdout
+    return "voxlock-mic" in args
+
+
+def refresh_portaudio(wait=True):
+    if not AUDIO_LOCK.acquire(blocking=wait):
+        return False
+    try:
+        sd._terminate()
+        sd._initialize()
+    finally:
+        AUDIO_LOCK.release()
+    return True
+
+
+def input_chunks(mic, stop, seconds=None):
+    chunks = queue.Queue()
+
+    def collect(indata, frames, at, status):
+        chunks.put(indata[:, 0].copy())
+
+    with sd.InputStream(device=mic["index"], samplerate=SR, channels=1, dtype="float32", blocksize=BLOCK, callback=collect):
+        received = 0
+        skipped = 0
+        while not stop() and (seconds is None or received < seconds * SR):
+            try:
+                chunk = chunks.get(timeout=INPUT_TIMEOUT_SECONDS)
+            except queue.Empty:
+                raise VoxLockError(f"no audio from {mic['name']}: it may have been disconnected") from None
+            if skipped < MIC_WARMUP_SECONDS * SR:
+                skipped += len(chunk)
+                continue
+            received += len(chunk)
+            yield chunk
 
 
 def ensure_device():
@@ -82,7 +184,7 @@ def ensure_device():
         return
     blackhole = next((uid for uid, (_, name) in devices.items() if name == BLACKHOLE), None)
     if blackhole is None:
-        sys.exit(f"{BLACKHOLE} not found: install it with `brew install --cask blackhole-2ch` and reboot")
+        raise VoxLockError(f"{BLACKHOLE} not found: install it with `brew install --cask blackhole-2ch` and reboot")
     description = plistlib.dumps({
         "name": DEVICE_NAME,
         "uid": DEVICE_UID,
@@ -98,16 +200,15 @@ def ensure_device():
     corefoundation.CFRelease(plist)
     corefoundation.CFRelease(data)
     if err:
-        sys.exit(f"could not create {DEVICE_NAME}: CoreAudio error {err}")
+        raise VoxLockError(f"could not create {DEVICE_NAME}: CoreAudio error {err}")
     for _ in range(50):
-        sd._terminate()
-        sd._initialize()
+        refresh_portaudio()
         if any(d["name"] == DEVICE_NAME for d in sd.query_devices()):
-            break
+            log.info("created audio device %s", DEVICE_NAME)
+            print(f"created audio device {DEVICE_NAME}; pick it as the microphone in your call app", file=sys.stderr)
+            return
         time.sleep(0.1)
-    else:
-        sys.exit(f"created {DEVICE_NAME}, but it did not appear in 5 s: run voxlock-mic again")
-    print(f"created audio device {DEVICE_NAME}; pick it as the microphone in your call app", file=sys.stderr)
+    raise VoxLockError(f"created {DEVICE_NAME}, but it did not appear in 5 s: try again")
 
 
 def remove_device():
@@ -119,21 +220,6 @@ def remove_device():
     print(f"could not remove {DEVICE_NAME}: CoreAudio error {err}" if err else f"removed {DEVICE_NAME}")
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description=f"Microphone -> VoxLock -> {DEVICE_NAME}, for Zoom and other call apps.")
-    p.add_argument("--mic", help="input device name or index; default is the system input")
-    p.add_argument("--sample", help=f"wav with 3+ s of your voice; default {SAMPLES_DIR}/<mic>.wav, then {DEFAULT_SAMPLE}, else learn the voice live")
-    p.add_argument("--live", action="store_true", help="ignore saved samples and learn the voice from the first 3 s of speech")
-    p.add_argument("--chunk-ms", type=int, default=40)
-    p.add_argument("--precision", default="int8", choices=["int8", "int8-full", "fp16", "fp32"])
-    p.add_argument("--threads", type=int, default=1)
-    p.add_argument("--list", action="store_true", help="list audio devices and saved samples, then exit")
-    p.add_argument("--enroll", action="store_true", help=f"record your voice sample from --mic into {SAMPLES_DIR}/<mic>.wav and exit")
-    p.add_argument("--seconds", type=int, default=10, help="length of the --enroll recording")
-    p.add_argument("--remove-device", action="store_true", help=f"remove the {DEVICE_NAME} audio device and exit")
-    return p.parse_args()
-
-
 def device(value):
     return int(value) if value is not None and value.isdigit() else value
 
@@ -143,87 +229,505 @@ def is_virtual(dev):
 
 
 def sample_path(name):
-    return SAMPLES_DIR / (re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") + ".wav")
+    return CONFIG_DIR / (re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") + ".wav")
 
 
-def list_all():
-    print(sd.query_devices())
-    samples = sorted(SAMPLES_DIR.glob("*.wav"))
-    print(f"\nsamples in {SAMPLES_DIR}:" if samples else f"\nno samples in {SAMPLES_DIR}")
-    for s in samples:
-        print(f"  {s.name}")
-
-
-def enroll(mic, seconds):
-    path = sample_path(mic["name"])
-    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"Recording {seconds} s from {mic['name']}: talk normally, alone, in a quiet room", file=sys.stderr)
-    x = sd.rec(SR * seconds, samplerate=SR, channels=1, dtype="float32", device=mic["index"], blocking=True)[:, 0]
-    if not x.any():
-        sys.exit("microphone returned pure silence: wrong device, closed laptop lid or no microphone permission")
-    sf.write(path, x, SR)
-    print(f"saved {path}", file=sys.stderr)
-    if not DEFAULT_SAMPLE.exists():
-        sf.write(DEFAULT_SAMPLE, x, SR)
-        print(f"saved {DEFAULT_SAMPLE}, used for microphones without their own sample", file=sys.stderr)
-
-
-def auto_mic():
-    inputs = {sample_path(d["name"]): d for d in sd.query_devices() if d["max_input_channels"] > 0 and not is_virtual(d)}
-    enrolled = sorted((p for p in inputs if p.exists()), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not enrolled:
-        sys.exit(f"system input is a virtual device and no connected microphone has a sample in {SAMPLES_DIR}: pass --mic or run --enroll --mic <name>; devices:\n{sd.query_devices()}")
-    return inputs[enrolled[0]]
-
-
-def pick_sample(a, mic):
-    if a.live:
-        return None
-    if a.sample:
-        return Path(a.sample).expanduser()
+def sample_for(mic):
     for path in (sample_path(mic["name"]), DEFAULT_SAMPLE):
         if path.exists():
             return path
     return None
 
 
-def main():
-    a = parse_args()
-    if a.remove_device:
-        remove_device()
-        return
-    if a.list:
-        list_all()
-        return
-    mic = sd.query_devices(device(a.mic), "input")
-    if is_virtual(mic):
-        if a.mic is not None or a.enroll:
-            sys.exit(f"{mic['name']} is the virtual output, not a microphone: name a real microphone with --mic")
-        mic = auto_mic()
-    if a.enroll:
-        enroll(mic, a.seconds)
-        return
-    ensure_device()
-    out = sd.query_devices(DEVICE_NAME, "output")
-    mic = sd.query_devices(mic["name"], "input")
-    sample = pick_sample(a, mic)
-    block = SR * a.chunk_ms // 1000
-    vl = voxlock.VoxLock(precision=a.precision, threads=a.threads)
-    stream = vl.stream(voxlock.load_audio(str(sample))) if sample else vl.live()
-    with sd.InputStream(device=mic["index"], samplerate=SR, channels=1, dtype="float32", blocksize=block) as inp, \
-         sd.OutputStream(device=out["index"], samplerate=SR, channels=1, dtype="float32", blocksize=block) as o:
-        voice = f"sample {sample}" if sample else "learning the voice from the first 3 s of speech"
-        print(f"VoxLock: {mic['name']} -> {out['name']}, {voice}, Ctrl+C to stop", file=sys.stderr)
+def lid_closed():
+    out = subprocess.run(["/usr/sbin/ioreg", "-r", "-k", "AppleClamshellState", "-d", "1"], capture_output=True, text=True).stdout
+    return '"AppleClamshellState" = Yes' in out
+
+
+def auto_mic_order():
+    rank = {"blue": 0, "blea": 0, "bltn": 1, "usb ": 2}
+    candidates = []
+    for position, d in enumerate(property_ids(1, "dev#")):
+        name = property_string(d, "lnam")
+        transport = struct.pack(">I", (property_ids(d, "tran") or [0])[0]).decode("latin1")
+        if not name or not property_ids(d, "stm#", "inpt") or name in (BLACKHOLE, DEVICE_NAME) or transport in ("virt", "grup"):
+            continue
+        if transport == "bltn" and lid_closed():
+            continue
+        candidates.append((rank.get(transport, 3), position, name))
+    return [name for _, _, name in sorted(candidates)]
+
+
+def auto_mic():
+    known = {d["name"]: d for d in sd.query_devices() if d["max_input_channels"] > 0}
+    for name in auto_mic_order():
+        if name in known:
+            return known[name]
+    raise VoxLockError("no working microphone found: connect one or choose it in Microphone")
+
+
+def resolve_mic(choice):
+    if choice:
         try:
-            while True:
-                chunk, overflowed = inp.read(block)
-                if overflowed:
-                    print("input overflow", file=sys.stderr)
-                y = stream.push(chunk[:, 0])
+            mic = sd.query_devices(device(choice), "input")
+            if not is_virtual(mic):
+                return mic
+        except ValueError:
+            log.warning("microphone %s is not connected, choosing automatically", choice)
+    return auto_mic()
+
+
+def record_sample(mic, seconds):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with AUDIO_LOCK:
+        x = np.concatenate(list(input_chunks(mic, lambda: False, seconds)))[: SR * seconds]
+    if not x.any():
+        raise VoxLockError("the microphone returned pure silence: wrong device, closed laptop lid or no microphone permission")
+    path = sample_path(mic["name"])
+    sf.write(path, x, SR)
+    saved = [path]
+    if not DEFAULT_SAMPLE.exists():
+        sf.write(DEFAULT_SAMPLE, x, SR)
+        saved.append(DEFAULT_SAMPLE)
+    return saved
+
+
+def isolate(vl, mic, sample, stop, on_active=None, on_silence=None):
+    out = sd.query_devices(DEVICE_NAME, "output")
+    stream = vl.stream(voxlock.load_audio(str(sample))) if sample else vl.live()
+    zeros = 0
+    with AUDIO_LOCK, sd.OutputStream(device=out["index"], samplerate=SR, channels=1, dtype="float32", blocksize=BLOCK) as o:
+        chunks = input_chunks(mic, stop)
+        try:
+            for i, chunk in enumerate(chunks):
+                if i == 0 and on_active:
+                    on_active()
+                zeros = 0 if chunk.any() else zeros + len(chunk)
+                if on_silence:
+                    on_silence(zeros >= SILENCE_WARNING_SECONDS * SR)
+                y = stream.push(chunk)
                 if len(y):
                     o.write(y.reshape(-1, 1))
-        except KeyboardInterrupt:
-            pass
+        finally:
+            chunks.close()
+
+
+def load_settings():
+    try:
+        return {"auto": True, "mic": None} | json.loads(SETTINGS_FILE.read_text())
+    except (OSError, ValueError):
+        return {"auto": True, "mic": None}
+
+
+def save_settings(settings):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+
+
+def set_login_item(enabled):
+    if not enabled:
+        LOGIN_AGENT.unlink(missing_ok=True)
+        return
+    LOGIN_AGENT.parent.mkdir(parents=True, exist_ok=True)
+    LOGIN_AGENT.write_bytes(plistlib.dumps({
+        "Label": BUNDLE_ID,
+        "ProgramArguments": ["/usr/bin/open", "-b", BUNDLE_ID],
+        "RunAtLoad": True,
+    }))
+
+
+class Engine:
+    def __init__(self, settings):
+        self.settings = settings
+        self.state = "waiting"
+        self.detail = ""
+        self.started_by_call = False
+        self.suppressed = False
+        self.silent = False
+        self.failed_at = 0.0
+        self._vl = None
+        self._model_lock = threading.Lock()
+        self._thread = None
+        self._stop = threading.Event()
+
+    def model(self):
+        with self._model_lock:
+            if self._vl is None:
+                log.info("loading the VoxLock model")
+                self._vl = voxlock.VoxLock(precision="int8", threads=1)
+            return self._vl
+
+    def running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self, by_call):
+        if self.running():
+            return
+        self.started_by_call = by_call
+        self._stop.clear()
+        self.state, self.detail = "starting", ""
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3)
+            if self._thread.is_alive():
+                log.warning("isolation thread is still stopping")
+
+    def _run(self):
+        try:
+            vl = self.model()
+            with AUDIO_LOCK:
+                if self._stop.is_set():
+                    return
+                refresh_portaudio()
+                ensure_device()
+                mic = resolve_mic(self.settings.get("mic"))
+                sample = sample_path(mic["name"])
+                if not sample.exists():
+                    log.info("no voice sample for %s", mic["name"])
+                    self.state, self.detail = "needs_sample", mic["name"]
+                    return
+                detail = f"{mic['name']} · {sample.name}"
+                self.silent = False
+
+                def active():
+                    if not self._stop.is_set():
+                        self.state, self.detail = "active", detail
+                        log.info("active: %s", detail)
+
+                def silence(flag):
+                    if flag and not self.silent:
+                        log.warning("%s delivers pure silence", mic["name"])
+                    self.silent = flag
+
+                isolate(vl, mic, sample, self._stop.is_set, active, silence)
+                log.info("stopped")
+        except Exception as e:
+            log.exception("isolation failed")
+            self.state, self.detail, self.failed_at = "error", str(e), time.monotonic()
+        finally:
+            if self.state in ("starting", "active"):
+                self.state, self.detail = "waiting", ""
+
+
+def watch_calls(engine):
+    last_seen = 0.0
+    while True:
+        time.sleep(1)
+        try:
+            readers = other_readers(call_device_ids())
+            now = time.monotonic()
+            if readers:
+                last_seen = now
+            elif engine.suppressed and now - last_seen > IDLE_STOP_SECONDS:
+                engine.suppressed = False
+            if not engine.settings["auto"] or engine.suppressed or engine.state in ("needs_sample", "recording"):
+                continue
+            if readers and not engine.running():
+                if engine.state == "error" and now - engine.failed_at < ERROR_RETRY_SECONDS:
+                    continue
+                log.info("call detected, readers %s", readers)
+                engine.start(by_call=True)
+            elif not readers and engine.running() and engine.started_by_call and now - last_seen > IDLE_STOP_SECONDS:
+                log.info("call ended")
+                engine.stop()
+        except Exception:
+            log.exception("call watcher failed")
+
+
+def acquire_lock():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    handle = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return None
+    return handle
+
+
+def run_tray():
+    import rumps
+    from AppKit import NSApplication
+
+    logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    lock = acquire_lock()
+    if lock is None:
+        log.info("already running")
+        return
+    NSApplication.sharedApplication().setActivationPolicy_(1)
+
+    def alert(**kwargs):
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        return rumps.alert(**kwargs)
+    settings = load_settings()
+    engine = Engine(settings)
+    threading.Thread(target=engine.model, daemon=True).start()
+    threading.Thread(target=watch_calls, args=(engine,), daemon=True).start()
+
+    class Tray(rumps.App):
+        def __init__(self):
+            super().__init__("VoxLock Mic", title=ICON, quit_button=None)
+            self.status = rumps.MenuItem("Starting…")
+            self.auto = rumps.MenuItem("Turn on during calls", callback=self.on_auto)
+            self.toggle = rumps.MenuItem("Turn on now", callback=self.on_toggle)
+            self.mics = rumps.MenuItem("Microphone")
+            self.enroll = rumps.MenuItem("Record voice sample (10 s)", callback=self.on_enroll)
+            self.login = rumps.MenuItem("Open at login", callback=self.on_login)
+            self.menu = [self.status, None, self.auto, self.toggle, self.mics, self.enroll, None, self.login,
+                         rumps.MenuItem("Open log", callback=self.on_log), rumps.MenuItem("Quit VoxLock Mic", callback=self.on_quit)]
+            self.mic_names = None
+            self.recording = None
+            self.message = None
+            self.asked = None
+            self.checked_at_start = False
+            self.timer = rumps.Timer(self.refresh, 0.5)
+            self.timer.start()
+
+        def state(self):
+            if self.recording:
+                return "recording"
+            if not settings["auto"] and not engine.running() and engine.state == "waiting":
+                return "off"
+            return engine.state
+
+        def refresh(self, _):
+            state = self.state()
+            texts = {
+                "waiting": "Waiting for a call",
+                "starting": "Starting…",
+                "active": f"On: {engine.detail}" + (" · no sound from the microphone" if engine.silent else ""),
+                "error": f"Error: {engine.detail}",
+                "off": "Off",
+                "recording": self.recording or "",
+                "needs_sample": f"Needs a voice sample for {engine.detail}",
+            }
+            self.status.title = texts[state]
+            self.auto.state = int(settings["auto"])
+            self.toggle.title = "Turn off" if engine.running() else "Turn on now"
+            self.login.state = int(LOGIN_AGENT.exists())
+            title = ICON + "⚠️" if state == "error" else ICON
+            if self.title != title:
+                self.title = title
+            names = real_input_names()
+            if names != self.mic_names:
+                self.mic_names = names
+                self.build_mic_menu()
+            if self.message:
+                title, text = self.message
+                self.message = None
+                alert(title=title, message=text)
+            if not self.checked_at_start:
+                self.checked_at_start = True
+                self.check_sample(start_after=False)
+            if engine.state == "needs_sample" and not self.recording and self.asked != engine.detail:
+                self.asked = engine.detail
+                self.ask_record(engine.detail, start_after=True, by_call=engine.started_by_call)
+            elif engine.state != "needs_sample":
+                self.asked = None
+
+        def check_sample(self, start_after, by_call=False):
+            try:
+                refresh_portaudio(wait=False)
+                mic = resolve_mic(settings.get("mic"))
+            except VoxLockError:
+                alert(title="Choose your microphone", message="Pick the microphone you talk into in VoxLock Mic → Microphone, then record a voice sample.")
+                return
+            if not sample_path(mic["name"]).exists():
+                self.ask_record(mic["name"], start_after, by_call)
+
+        def ask_record(self, mic_name, start_after, by_call):
+            answer = alert(
+                title="Record your voice",
+                message=f"VoxLock needs a 10-second sample of your voice from {mic_name}.\n\nPress Record and read the text that appears, in your normal voice, alone.\n\nVoxLock нужен 10-секундный образец вашего голоса с микрофона {mic_name}. Нажмите Record и прочитайте появившийся текст обычным голосом.",
+                ok="Record",
+                cancel="Not now",
+            )
+            if answer == 1:
+                self.start_recording(mic_name, start_after, by_call)
+            else:
+                engine.suppressed = True
+                engine.state = "waiting"
+
+        def start_recording(self, mic_name, start_after, by_call):
+            if self.recording:
+                return
+            if mic_name is None:
+                try:
+                    refresh_portaudio(wait=False)
+                    mic_name = resolve_mic(settings.get("mic"))["name"]
+                except VoxLockError:
+                    alert(title="Choose your microphone", message="Pick the microphone you talk into in VoxLock Mic → Microphone, then record a voice sample.")
+                    return
+            if engine.running():
+                engine.suppressed = True
+                engine.stop()
+            engine.state = "recording"
+            self.recording = "Preparing to record…"
+            threading.Thread(target=self.enroll_worker, args=(mic_name, start_after, by_call), daemon=True).start()
+            alert(title=f"Recording from {mic_name} for 10 seconds: read aloud", message=READ_ALOUD, ok="Done")
+
+        def build_mic_menu(self):
+            if self.mics._menu is not None:
+                self.mics.clear()
+            choice = settings.get("mic")
+            automatic = rumps.MenuItem("Automatic", callback=self.on_mic)
+            automatic.state = int(not choice)
+            self.mics.add(automatic)
+            self.mics.add(None)
+            for name in self.mic_names:
+                item = rumps.MenuItem(name, callback=self.on_mic)
+                item.state = int(name == choice)
+                self.mics.add(item)
+
+        def busy(self):
+            return bool(self.recording) or engine.state == "recording"
+
+        def on_mic(self, item):
+            if self.busy():
+                return
+            settings["mic"] = None if item.title == "Automatic" else item.title
+            save_settings(settings)
+            for other in self.mics.values():
+                if isinstance(other, rumps.MenuItem):
+                    other.state = int(other is item)
+            was_running, by_call = engine.running(), engine.started_by_call
+            if was_running:
+                engine.stop()
+            engine.suppressed = False
+            self.check_sample(start_after=was_running, by_call=by_call)
+            if was_running and engine.state != "recording" and not engine.suppressed:
+                engine.start(by_call=by_call)
+
+        def on_auto(self, _):
+            settings["auto"] = not settings["auto"]
+            save_settings(settings)
+            if not settings["auto"] and engine.running() and engine.started_by_call:
+                engine.stop()
+
+        def on_toggle(self, _):
+            if self.busy():
+                return
+            if engine.running():
+                engine.suppressed = True
+                engine.stop()
+            else:
+                engine.suppressed = False
+                engine.state = "waiting"
+                engine.start(by_call=False)
+
+        def on_enroll(self, _):
+            self.start_recording(None, start_after=engine.running(), by_call=engine.started_by_call)
+
+        def enroll_worker(self, mic_name, start_after, by_call):
+            try:
+                refresh_portaudio()
+                mic = sd.query_devices(mic_name, "input") if mic_name else resolve_mic(settings.get("mic"))
+                self.recording = f"Recording from {mic['name']}: talk for 10 s"
+                saved = record_sample(mic, 10)
+                log.info("saved voice sample %s", saved)
+                engine.state = "waiting"
+                if start_after:
+                    engine.suppressed = False
+                    engine.start(by_call=by_call)
+                else:
+                    self.message = ("Voice sample saved", f"{mic['name']}: {saved[0].name}")
+            except Exception as e:
+                log.exception("recording the voice sample failed")
+                engine.state = "waiting"
+                self.message = ("Recording failed", str(e))
+            finally:
+                self.recording = None
+
+        def on_login(self, _):
+            set_login_item(not LOGIN_AGENT.exists())
+
+        def on_log(self, _):
+            subprocess.run(["/usr/bin/open", "-a", "Console", str(LOG_FILE)])
+
+        def on_quit(self, _):
+            engine.stop()
+            rumps.quit_application()
+
+    log.info("VoxLock Mic started, pid %s", os.getpid())
+    Tray().run()
+
+
+def run_console(a):
+    mic = sd.query_devices(device(a.mic), "input")
+    if is_virtual(mic):
+        if a.mic is not None:
+            raise VoxLockError(f"{mic['name']} is the virtual output, not a microphone: name a real microphone with --mic")
+        mic = auto_mic()
+    ensure_device()
+    mic = sd.query_devices(mic["name"], "input")
+    sample = None if a.live else Path(a.sample).expanduser() if a.sample else sample_for(mic)
+    vl = voxlock.VoxLock(precision=a.precision, threads=a.threads)
+    voice = f"sample {sample}" if sample else "learning the voice from the first 3 s of speech"
+    print(f"VoxLock: {mic['name']} -> {DEVICE_NAME}, {voice}, Ctrl+C to stop", file=sys.stderr)
+    try:
+        isolate(vl, mic, sample, lambda: False)
+    except KeyboardInterrupt:
+        pass
+
+
+def run_enroll(a):
+    mic = sd.query_devices(device(a.mic), "input")
+    if is_virtual(mic):
+        raise VoxLockError(f"{mic['name']} is the virtual output, not a microphone: name a real microphone with --mic")
+    print(f"Recording {a.seconds} s from {mic['name']}: talk normally, alone, in a quiet room", file=sys.stderr)
+    for path in record_sample(mic, a.seconds):
+        print(f"saved {path}", file=sys.stderr)
+
+
+def list_all():
+    print(sd.query_devices())
+    samples = sorted(CONFIG_DIR.glob("*.wav"))
+    print(f"\nsamples in {CONFIG_DIR}:" if samples else f"\nno samples in {CONFIG_DIR}")
+    for s in samples:
+        print(f"  {s.name}")
+
+
+def open_app():
+    if subprocess.run(["/usr/bin/open", "-b", BUNDLE_ID]).returncode:
+        raise VoxLockError("VoxLock Mic.app is not installed: use --console to run in this terminal")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=f"Microphone -> VoxLock -> {DEVICE_NAME}, for Zoom and other call apps. Without options it opens the VoxLock Mic menu bar app.")
+    p.add_argument("--console", action="store_true", help="run in this terminal until Ctrl+C instead of the menu bar app")
+    p.add_argument("--tray", action="store_true", help="run the menu bar app in this process")
+    p.add_argument("--mic", help="input device name or index; default is the system input")
+    p.add_argument("--sample", help=f"wav with 3+ s of your voice; default {CONFIG_DIR}/<mic>.wav, then {DEFAULT_SAMPLE}, else learn the voice live")
+    p.add_argument("--live", action="store_true", help="ignore saved samples and learn the voice from the first 3 s of speech")
+    p.add_argument("--precision", default="int8", choices=["int8", "int8-full", "fp16", "fp32"])
+    p.add_argument("--threads", type=int, default=1)
+    p.add_argument("--list", action="store_true", help="list audio devices and saved samples, then exit")
+    p.add_argument("--enroll", action="store_true", help=f"record your voice sample from --mic into {CONFIG_DIR}/<mic>.wav and exit")
+    p.add_argument("--seconds", type=int, default=10, help="length of the --enroll recording")
+    p.add_argument("--remove-device", action="store_true", help=f"remove the {DEVICE_NAME} audio device and exit")
+    return p.parse_args()
+
+
+def main():
+    a = parse_args()
+    try:
+        if a.remove_device:
+            remove_device()
+        elif a.list:
+            list_all()
+        elif a.enroll:
+            run_enroll(a)
+        elif a.tray:
+            run_tray()
+        elif a.console or a.mic or a.sample or a.live:
+            run_console(a)
+        else:
+            open_app()
+    except VoxLockError as e:
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":
