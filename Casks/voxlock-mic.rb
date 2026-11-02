@@ -1,5 +1,5 @@
 cask "voxlock-mic" do
-  version "1.0.0"
+  version "0.0.1"
   sha256 "3fa55a34140d6136923b5aa0efcd53b89dd454d6a4922d7611be1e9abd406c91"
 
   url "https://raw.githubusercontent.com/hazge/homebrew-tools/voxlock-mic-#{version}/voxlock-mic/voxlock-mic"
