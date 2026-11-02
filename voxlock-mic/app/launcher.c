@@ -1,3 +1,5 @@
+#include <CoreAudio/CoreAudio.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <errno.h>
 #include <libgen.h>
 #include <limits.h>
@@ -5,6 +7,7 @@
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/wait.h>
 
 extern char **environ;
@@ -15,7 +18,32 @@ static void forward(int sig) {
     if (child > 0) kill(child, sig);
 }
 
-int main(void) {
+static int remove_device(void) {
+    CFStringRef uid = CFSTR("com.hazge.voxlock-mic.aggregate");
+    AudioObjectPropertyAddress address = {
+        kAudioHardwarePropertyTranslateUIDToDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain,
+    };
+    AudioObjectID device = kAudioObjectUnknown;
+    UInt32 size = sizeof device;
+    OSStatus err = AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, sizeof uid, &uid, &size, &device);
+    if (err != noErr || device == kAudioObjectUnknown) {
+        printf("VoxLock Microphone not found\n");
+        return 0;
+    }
+    err = AudioHardwareDestroyAggregateDevice(device);
+    if (err != noErr) {
+        fprintf(stderr, "could not remove VoxLock Microphone: CoreAudio error %d\n", (int)err);
+        return 1;
+    }
+    printf("removed VoxLock Microphone\n");
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--remove-device") == 0) return remove_device();
+
     char exe[PATH_MAX];
     uint32_t size = sizeof exe;
     if (_NSGetExecutablePath(exe, &size) != 0) return 1;
@@ -42,9 +70,9 @@ int main(void) {
     posix_spawnattr_init(&attr);
     posix_spawnattr_setsigmask(&attr, &empty);
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK);
-    char *argv[] = {"/bin/bash", script, NULL};
+    char *child_argv[] = {"/bin/bash", script, NULL};
     pid_t pid;
-    int spawned = posix_spawn(&pid, "/bin/bash", NULL, &attr, argv, environ);
+    int spawned = posix_spawn(&pid, "/bin/bash", NULL, &attr, child_argv, environ);
     posix_spawnattr_destroy(&attr);
     if (spawned != 0) return 1;
     child = pid;

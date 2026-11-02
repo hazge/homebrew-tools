@@ -53,6 +53,7 @@ The log is `~/Library/Logs/voxlock-mic.log`.
 ### Uninstall
 
 ```
-voxlock-mic --remove-device
 brew uninstall --cask voxlock-mic
 ```
+
+Uninstalling, and upgrading, removes the VoxLock Microphone device; the app creates it again when it starts. `brew uninstall --zap` also deletes the voice samples, the log and the login item. BlackHole stays installed: remove it with `brew uninstall --cask blackhole-2ch`.

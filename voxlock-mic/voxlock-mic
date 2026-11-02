@@ -467,6 +467,16 @@ def run_tray():
     threading.Thread(target=engine.model, daemon=True).start()
     threading.Thread(target=watch_calls, args=(engine,), daemon=True).start()
 
+    def create_device():
+        try:
+            with AUDIO_LOCK:
+                ensure_device()
+        except Exception as e:
+            log.exception("could not create %s", DEVICE_NAME)
+            engine.state, engine.detail, engine.failed_at = "error", str(e), time.monotonic()
+
+    threading.Thread(target=create_device, daemon=True).start()
+
     class Tray(rumps.App):
         def __init__(self):
             super().__init__("VoxLock Mic", title=ICON, quit_button=None)
