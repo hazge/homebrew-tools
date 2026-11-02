@@ -30,8 +30,8 @@ cask "voxlock-mic" do
 
   caveats <<~EOS
     Reboot once after the first install of blackhole-2ch so the BlackHole device appears.
-    VoxLock Mic is not notarized: on its first launch, and after an upgrade, open
-    System Settings → Privacy & Security and press "Open Anyway".
+    VoxLock Mic is not notarized: when macOS blocks its first launch, press "Done", open
+    System Settings → Privacy & Security, press "Open Anyway", then open VoxLock Mic again.
     The first start installs Python packages and downloads the model, which takes a minute.
     In your call app pick "VoxLock Microphone" as the microphone.
     Details: https://github.com/hazge/homebrew-tools#voxlock-mic
