@@ -4,6 +4,7 @@ Homebrew tap with small tools.
 
 ```
 brew install --cask hazge/tools/voxlock-mic
+brew install --cask hazge/tools/mouser
 ```
 
 ## VoxLock Mic
@@ -57,3 +58,19 @@ brew uninstall --cask voxlock-mic
 ```
 
 Uninstalling, and upgrading, removes the VoxLock Microphone device; the app creates it again when it starts. `brew uninstall --zap` also deletes the voice samples, the log and the login item. BlackHole stays installed: remove it with `brew uninstall --cask blackhole-2ch`.
+
+## Mouser
+
+Cask for [Mouser](https://github.com/TomBadash/Mouser), a local button remapper for Logitech HID++ mice such as the MX Master 3S, used instead of Logi Options+. The app comes from the upstream GitHub releases; this tap only packages it.
+
+```
+brew install --cask hazge/tools/mouser
+```
+
+1. Quit Logi Options+: both apps need the mouse over HID++ and only one can own it.
+2. Open Mouser. The app is not notarized, so the first time macOS blocks it: press **Done**, open System Settings → Privacy & Security, press **Open Anyway** and confirm, then open Mouser again. A reinstall or upgrade needs the same steps.
+3. Grant Accessibility to Mouser when asked; the Back and Forward buttons need it.
+
+The settings are `~/Library/Application Support/Mouser/config.json`. `brew uninstall --zap --cask mouser` also deletes them and the login item.
+
+To move to a new release, set `version` and both `sha256` values in `Casks/mouser.rb` from the release assets `Mouser-macOS.zip` and `Mouser-macOS-intel.zip`.
